@@ -1,0 +1,4 @@
+matplotlib
+pyyaml
+pandas>2
+astropy
