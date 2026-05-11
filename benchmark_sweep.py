@@ -69,7 +69,7 @@ timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 # already encodes "gpu" in the suffix, so we don't double-mark it.
 gpu_prefix = "gpu-" if gpu_mode and args.vary != "gpu" else ""
 gpu_suffix = f"-gpu=[{args.min}-{args.max}]" if args.vary == "gpu" else ""
-out_path = args.out or (f"logs/"
+out_path = args.out or (f"logs/benchmark-sweep/"
                         f"{gpu_prefix}"
                         f"na={args.n_alert_workers if args.vary != 'alert' else f'[{args.min}-{args.max}]'}-"
                         f"ne={args.n_enrichment_workers if args.vary != 'enrichment' else f'[{args.min}-{args.max}]'}-"
@@ -82,8 +82,6 @@ run_py = os.path.join(args.boom_repo_dir, "tests", "throughput", "run.py")
 
 results: list[tuple[int, float, float]] = []
 for n in range(args.min, args.max + 1):
-    if n != 5 and n != 10 and n != 15:
-        continue
     counts = {
         "alert": args.n_alert_workers,
         "enrichment": args.n_enrichment_workers,
