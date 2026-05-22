@@ -24,9 +24,9 @@ parser.add_argument(
 )
 parser.add_argument("--min", type=int, default=1)
 parser.add_argument("--max", type=int, default=10)
-parser.add_argument("--n-alert-workers", type=int, default=7)
-parser.add_argument("--n-enrichment-workers", type=int, default=23)
-parser.add_argument("--n-filter-workers", type=int, default=6)
+parser.add_argument("--n-alert-workers", type=int, default=20)
+parser.add_argument("--n-enrichment-workers", type=int, default=33)
+parser.add_argument("--n-filter-workers", type=int, default=15)
 parser.add_argument("--boom-repo-dir", default=".")
 parser.add_argument("--timeout", type=int, default=600)
 parser.add_argument("--out", default=None, help="Output plot path")
@@ -45,10 +45,109 @@ parser.add_argument(
     default=None,
     help="Comma-separated GPU device IDs to use (e.g. 0,1,2,3). Implies --gpu.",
 )
+parser.add_argument(
+    "--warm",
+    action="store_true",
+    help=(
+        "Warm-sweep mode: start MongoDB / Valkey / Kafka and run the producer "
+        "exactly once before the loop, then reuse them across iterations via "
+        "fast in-server state resets. Saves the per-iteration cost of "
+        "mongorestore, NED import, Kafka topic creation, and re-producing the "
+        "alerts."
+    ),
+)
+parser.add_argument(
+    "--init",
+    action="store_true",
+    help=(
+        "Run only the warm setup (start services, mongorestore, NED, kafka "
+        "producer) and exit. Use before a series of --bench-only invocations "
+        "to amortize setup across many sweeps."
+    ),
+)
+parser.add_argument(
+    "--clean",
+    action="store_true",
+    help="Run only the warm teardown (stop all services) and exit.",
+)
+parser.add_argument(
+    "--bench-only",
+    action="store_true",
+    help=(
+        "Run only the bench loop, assuming services are already up from a "
+        "prior --init invocation. Skips setup and teardown."
+    ),
+)
+parser.add_argument(
+    "--alert-only",
+    action="store_true",
+    help=(
+        "Per-iteration: run_alert_only.py to measure alert-worker wall time "
+        "(consumer first message -> LLEN ZTF_alerts_enrichment_queue == "
+        "EXPECTED_ALERTS). Forces n_enrichment_workers=0 and n_filter_workers=0. "
+        "Only --vary alert is meaningful here (the alert worker does no GPU "
+        "inference)."
+    ),
+)
+parser.add_argument(
+    "--enrichment-only",
+    action="store_true",
+    help=(
+        "Per-iteration: run_alert_only.py to fill the enrichment queue, then "
+        "run_enrichment_only.py to measure the enrichment-worker wall time "
+        "(starting enrichment worker -> LLEN ZTF_alerts_filter_queue == "
+        "EXPECTED_ALERTS). Sweeping makes sense over --vary enrichment or gpu."
+    ),
+)
+parser.add_argument(
+    "--filter-only",
+    action="store_true",
+    help=(
+        "Per-iteration: chain run_alert_only.py + run_enrichment_only.py to "
+        "fill the filter queue, then run_filter_only.py to measure the "
+        "filter-worker wall time (starting filter worker -> Kafka "
+        "ZTF_alerts_results offset sum reaches N_FILTERS * EXPECTED_ALERTS). "
+        "Only --vary filter is meaningful (no GPU inference)."
+    ),
+)
 args = parser.parse_args()
+
+stage_only_flags = [args.alert_only, args.enrichment_only, args.filter_only]
+if sum(stage_only_flags) > 1:
+    sys.exit("--alert-only / --enrichment-only / --filter-only are mutually exclusive")
+
+phase_only_flags = [args.init, args.clean, args.bench_only]
+if sum(phase_only_flags) > 1:
+    sys.exit("--init / --clean / --bench-only are mutually exclusive")
+if any(phase_only_flags) and args.warm:
+    sys.exit(
+        "--init / --clean / --bench-only are incompatible with --warm "
+        "(--warm is the all-in-one mode; the new flags split it into stages)"
+    )
+if any(phase_only_flags) and args.from_logs:
+    sys.exit("--init / --clean / --bench-only are incompatible with --from-logs")
 
 if args.vary == "gpu" and args.gpu_device_ids:
     sys.exit("--gpu-device-ids is incompatible with --vary gpu (the sweep generates them)")
+if args.warm and args.from_logs:
+    sys.exit("--warm and --from-logs are incompatible (warm mode actively runs the bench)")
+if args.alert_only and args.vary != "alert":
+    sys.exit(
+        f"--alert-only is only meaningful with --vary alert (got --vary {args.vary}). "
+        f"Enrichment/filter workers are forced to 0, and the alert worker does "
+        f"no GPU inference, so sweeping enrichment/filter/gpu has no effect."
+    )
+if args.enrichment_only and args.vary not in ("enrichment", "gpu"):
+    sys.exit(
+        f"--enrichment-only is only meaningful with --vary enrichment or --vary gpu "
+        f"(got --vary {args.vary}). Alert/filter workers are forced to 0."
+    )
+if args.filter_only and args.vary != "filter":
+    sys.exit(
+        f"--filter-only is only meaningful with --vary filter (got --vary {args.vary}). "
+        f"Alert/enrichment workers are forced to 0, and the filter worker does "
+        f"no GPU inference."
+    )
 
 gpu_mode = args.vary == "gpu" or args.gpu or bool(args.gpu_device_ids)
 if gpu_mode:
@@ -69,7 +168,15 @@ timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 # already encodes "gpu" in the suffix, so we don't double-mark it.
 gpu_prefix = "gpu-" if gpu_mode and args.vary != "gpu" else ""
 gpu_suffix = f"-gpu=[{args.min}-{args.max}]" if args.vary == "gpu" else ""
+stage_only_prefix = ""
+if args.alert_only:
+    stage_only_prefix = "alert-only-"
+elif args.enrichment_only:
+    stage_only_prefix = "enrichment-only-"
+elif args.filter_only:
+    stage_only_prefix = "filter-only-"
 out_path = args.out or (f"logs/benchmark-sweep/"
+                        f"{stage_only_prefix}"
                         f"{gpu_prefix}"
                         f"na={args.n_alert_workers if args.vary != 'alert' else f'[{args.min}-{args.max}]'}-"
                         f"ne={args.n_enrichment_workers if args.vary != 'enrichment' else f'[{args.min}-{args.max}]'}-"
@@ -79,6 +186,144 @@ out_path = args.out or (f"logs/benchmark-sweep/"
 plot_path = out_path + ".png"
 csv_path = out_path + ".csv"
 run_py = os.path.join(args.boom_repo_dir, "tests", "throughput", "run.py")
+run_alert_only_py = os.path.join(
+    args.boom_repo_dir, "tests", "throughput", "run_alert_only.py"
+)
+run_enrichment_only_py = os.path.join(
+    args.boom_repo_dir, "tests", "throughput", "run_enrichment_only.py"
+)
+run_filter_only_py = os.path.join(
+    args.boom_repo_dir, "tests", "throughput", "run_filter_only.py"
+)
+
+
+def run_phase(phase: str, counts: dict[str, int]) -> int:
+    """Invoke run.py for a given phase and return its exit code.
+
+    The worker counts are forwarded so that run.py can write the corresponding
+    config.yaml, even for phases where they have no effect (setup/teardown
+    write nothing benchmark-shaped; bench/full need them for BOOM startup).
+    """
+    cmd = [
+        sys.executable,
+        run_py,
+        "--apptainer",
+        "--n-alert-workers", str(counts["alert"]),
+        "--n-enrichment-workers", str(counts["enrichment"]),
+        "--n-filter-workers", str(counts["filter"]),
+        "--boom-repo-dir", args.boom_repo_dir,
+        "--timeout", str(args.timeout),
+        "--phase", phase,
+    ]
+    return subprocess.run(cmd).returncode
+
+
+def run_alert_only_bench(counts: dict[str, int]) -> int:
+    """Invoke run_alert_only.py for a single bench iteration.
+
+    Setup/teardown still go through run.py since the underlying services
+    (mongo, valkey, kafka, boom apptainer instance) are identical; only the
+    bench phase differs (config rewritten with n_enrichment=0, n_filter=0 and
+    LLEN-based completion signal).
+    """
+    cmd = [
+        sys.executable,
+        run_alert_only_py,
+        "--apptainer",
+        "--n-alert-workers", str(counts["alert"]),
+        "--boom-repo-dir", args.boom_repo_dir,
+        "--timeout", str(args.timeout),
+    ]
+    return subprocess.run(cmd).returncode
+
+
+def run_enrichment_only_bench(counts: dict[str, int]) -> int:
+    """Invoke run_enrichment_only.py for a single bench iteration."""
+    cmd = [
+        sys.executable,
+        run_enrichment_only_py,
+        "--apptainer",
+        "--n-enrichment-workers", str(counts["enrichment"]),
+        "--boom-repo-dir", args.boom_repo_dir,
+        "--timeout", str(args.timeout),
+    ]
+    return subprocess.run(cmd).returncode
+
+
+def run_filter_only_bench(counts: dict[str, int]) -> int:
+    """Invoke run_filter_only.py for a single bench iteration."""
+    cmd = [
+        sys.executable,
+        run_filter_only_py,
+        "--apptainer",
+        "--n-filter-workers", str(counts["filter"]),
+        "--boom-repo-dir", args.boom_repo_dir,
+        "--timeout", str(args.timeout),
+    ]
+    return subprocess.run(cmd).returncode
+
+
+def gpus_for_path(n: int) -> int:
+    """Mirror the gpu=N component of the logs_dir that run.py writes to.
+
+    run.py derives this from BOOM_GPU__ENABLED + BOOM_GPU__DEVICE_IDS; we
+    replicate the same logic so that wall_time_path here matches the path
+    where wall_time.txt is actually written.
+    """
+    if os.environ.get("BOOM_GPU__ENABLED", "false").lower() != "true":
+        return 0
+    if args.vary == "gpu":
+        return n
+    device_ids_env = os.environ.get("BOOM_GPU__DEVICE_IDS", "0")
+    return len([d for d in device_ids_env.split(",") if d.strip()])
+
+setup_counts = None
+if args.init:
+    # Mirror the warm-setup worker-count derivation: counts only matter for
+    # config.yaml writes, which the bench phase overwrites anyway, but we
+    # populate them so run.py has something coherent to serialize.
+    setup_counts = {
+        "alert": args.min if args.vary == "alert" else args.n_alert_workers,
+        "enrichment": args.min if args.vary == "enrichment" else args.n_enrichment_workers,
+        "filter": args.min if args.vary == "filter" else args.n_filter_workers,
+    }
+    if args.vary == "gpu":
+        os.environ["BOOM_GPU__DEVICE_IDS"] = ",".join(str(i) for i in range(args.min))
+    print("\n=== Init: starting services + running producer (one-time) ===", flush=True)
+    init_rc = run_phase("setup", setup_counts)
+    if init_rc != 0:
+        sys.exit(f"Init failed (rc={init_rc})")
+    print("\n=== Init complete; services left running. ===", flush=True)
+    print("Run benchmark_sweep.py --bench-only ... to use them.")
+    print("Run benchmark_sweep.py --clean to stop them.")
+    sys.exit(0)
+
+if args.clean:
+    print("\n=== Clean: stopping all services ===", flush=True)
+    clean_counts = {
+        "alert": args.n_alert_workers,
+        "enrichment": args.n_enrichment_workers,
+        "filter": args.n_filter_workers,
+    }
+    sys.exit(run_phase("teardown", clean_counts))
+
+if args.warm:
+    # Warm setup uses the first iteration's worker counts; they only matter for
+    # config.yaml, which is overwritten every bench iteration anyway. For a
+    # --vary gpu sweep we also need to set BOOM_GPU__DEVICE_IDS up front so
+    # the apptainer instance start picks up a sensible default; the bench loop
+    # rebinds it per iteration before exec-ing the scheduler.
+    setup_counts = {
+        "alert": args.min if args.vary == "alert" else args.n_alert_workers,
+        "enrichment": args.min if args.vary == "enrichment" else args.n_enrichment_workers,
+        "filter": args.min if args.vary == "filter" else args.n_filter_workers,
+    }
+    if args.vary == "gpu":
+        os.environ["BOOM_GPU__DEVICE_IDS"] = ",".join(str(i) for i in range(args.min))
+    print("\n=== Warm setup: starting services + running producer (one-time) ===", flush=True)
+    setup_rc = run_phase("setup", setup_counts)
+    if setup_rc != 0:
+        sys.exit(f"Warm setup failed (rc={setup_rc}); aborting sweep")
 
 results: list[tuple[int, float, float]] = []
 for n in range(args.min, args.max + 1):
@@ -95,11 +340,32 @@ for n in range(args.min, args.max + 1):
         os.environ["BOOM_GPU__DEVICE_IDS"] = device_ids
         label = f"n_gpus={n} (device_ids={device_ids})"
 
-    wall_time_path = (
-        f"logs/boom-na={counts['alert']}"
-        f"-ne={counts['enrichment']}"
-        f"-nf={counts['filter']}/wall_time.txt"
-    )
+    if args.alert_only:
+        # Alert + filter workers run no GPU inference, so run_alert_only.py /
+        # run_filter_only.py drop the `-gpu=` segment from their logs_dir.
+        # Only enrichment-only includes it, since enrichment is the only stage
+        # that actually loads ONNX models on the GPU.
+        wall_time_path = (
+            f"logs/boom-alert-only-na={counts['alert']}"
+            f"/alert_worker_wall_time.txt"
+        )
+    elif args.enrichment_only:
+        wall_time_path = (
+            f"logs/boom-enrichment-only-ne={counts['enrichment']}"
+            f"-gpu={gpus_for_path(n)}/enrichment_worker_wall_time.txt"
+        )
+    elif args.filter_only:
+        wall_time_path = (
+            f"logs/boom-filter-only-nf={counts['filter']}"
+            f"/filter_worker_wall_time.txt"
+        )
+    else:
+        wall_time_path = (
+            f"logs/boom-na={counts['alert']}"
+            f"-ne={counts['enrichment']}"
+            f"-nf={counts['filter']}"
+            f"-gpu={gpus_for_path(n)}/wall_time.txt"
+        )
     if args.from_logs:
         if args.vary == "gpu":
             sys.exit("--from-logs is not supported with --vary gpu (all iterations "
@@ -109,17 +375,40 @@ for n in range(args.min, args.max + 1):
             continue
     else:
         print(f"\n=== Running with {label} ===", flush=True)
-        cmd = [
-            sys.executable,
-            run_py,
-            "--apptainer",
-            "--n-alert-workers", str(counts["alert"]),
-            "--n-enrichment-workers", str(counts["enrichment"]),
-            "--n-filter-workers", str(counts["filter"]),
-            "--boom-repo-dir", args.boom_repo_dir,
-            "--timeout", str(args.timeout),
-        ]
-        rc = subprocess.run(cmd).returncode
+        if args.alert_only or args.enrichment_only or args.filter_only:
+            # The "*_only" benchmarks rely on services that --warm (or a prior
+            # --init invocation, reused via --bench-only) brings up exactly
+            # once. Without either there is no setup phase and the downstream
+            # shell scripts would refuse to run.
+            if not (args.warm or args.bench_only):
+                sys.exit(
+                    "--alert-only / --enrichment-only / --filter-only require "
+                    "--warm or --bench-only (the *_only scripts assume services "
+                    "are already running)."
+                )
+            # Each "*_only" stage assumes the prior stage's output is sitting
+            # in the corresponding valkey queue. The first iteration of the
+            # sweep starts from an empty state, and every subsequent iteration
+            # has just drained the input queue of the target stage — so we
+            # re-run every prerequisite stage at the start of each iteration
+            # to refill the relevant queues. Yes, this is slow for sweeps that
+            # only vary the last stage, but it is the only way to keep the
+            # measurement of stage N independent of the stage-(N-1) workload.
+            rc = 0
+            if args.enrichment_only or args.filter_only:
+                rc = run_alert_only_bench(counts)
+            if rc == 0 and args.filter_only:
+                rc = run_enrichment_only_bench(counts)
+            if rc == 0:
+                if args.alert_only:
+                    rc = run_alert_only_bench(counts)
+                elif args.enrichment_only:
+                    rc = run_enrichment_only_bench(counts)
+                else:
+                    rc = run_filter_only_bench(counts)
+        else:
+            phase = "bench" if args.warm or args.bench_only else "full"
+            rc = run_phase(phase, counts)
         if rc != 0 or not os.path.exists(wall_time_path):
             print(f"  -> run failed (rc={rc}), skipping", file=sys.stderr)
             continue
@@ -129,6 +418,10 @@ for n in range(args.min, args.max + 1):
     results.append((n, wall_time_s, throughput))
     print(f"  {args.vary}={n} -> {wall_time_s:.1f} s ({throughput:.0f} alerts/s)")
 
+if args.warm:
+    print("\n=== Warm teardown: stopping all services ===", flush=True)
+    run_phase("teardown", setup_counts)
+
 if not results:
     sys.exit("No successful runs")
 
@@ -136,11 +429,22 @@ xs = [r[0] for r in results]
 walls = [r[1] for r in results]
 tputs = [r[2] for r in results]
 
+# In stage-only modes, the irrelevant stages have n_workers=0 (forced by the
+# run_*_only.py wrappers). Listing them as "fixed" in the subtitle is
+# misleading — they are not "fixed at args.n_*_workers", they are disabled.
+# So the legend only mentions stages that are actually active for this mode.
+stage_only = (
+    "alert" if args.alert_only
+    else "enrichment" if args.enrichment_only
+    else "filter" if args.filter_only
+    else None
+)
+fixed_stages = {stage_only} if stage_only else set(WORKER_KINDS)
 fixed = {k: v for k, v in {
     "alert": args.n_alert_workers,
     "enrichment": args.n_enrichment_workers,
     "filter": args.n_filter_workers,
-}.items() if k != args.vary}
+}.items() if k != args.vary and k in fixed_stages}
 fixed_str = ", ".join(f"{k}={v}" for k, v in fixed.items())
 
 vary_label = "GPUs" if args.vary == "gpu" else f"{args.vary} workers"
@@ -161,8 +465,39 @@ ax2.set_title(f"Throughput vs. {vary_label}")
 ax2.grid(True, alpha=0.3)
 
 gpu_tag = " GPU" if gpu_mode and args.vary != "gpu" else ""
-fig.suptitle(f"BOOM{gpu_tag} benchmark — varying {vary_label} ({fixed_str})")
-fig.tight_layout()
+
+# Main title is the stage name. The subtitle below lists what that stage
+# actually does, so the reader sees both the scope and the workload.
+STAGE_TITLES = {
+    "alert": "BOOM alert ingestion",
+    "enrichment": "BOOM enrichment",
+    "filter": "BOOM filtering",
+}
+STAGE_OPERATIONS = {
+    "alert": "kafka consume + avro decode + crossmatch + Mongo insert",
+    "enrichment": "ML inference + alert features + babamul Kafka push + Mongo update",
+    "filter": "filter pipelines (Mongo aggregations) + Kafka produce",
+}
+if stage_only is not None:
+    main_title = f"{STAGE_TITLES[stage_only]}{gpu_tag}"
+    # Only mention the varying axis when it isn't the stage itself; otherwise
+    # it's redundant (e.g. --alert-only only allows --vary alert).
+    if args.vary != stage_only:
+        main_title += f" — varying {vary_label}"
+    if fixed_str:
+        main_title += f" ({fixed_str})"
+    subtitle = STAGE_OPERATIONS[stage_only]
+else:
+    main_title = f"BOOM{gpu_tag} benchmark — varying {vary_label} ({fixed_str})"
+    subtitle = None
+
+fig.suptitle(main_title, fontsize=12)
+if subtitle:
+    # tight_layout below doesn't know about fig.text(), so reserve vertical
+    # space at the top so the subtitle and suptitle don't collide with the
+    # axes.
+    fig.text(0.5, 0.91, subtitle, ha="center", fontsize=9, style="italic")
+fig.tight_layout(rect=[0, 0, 1, 0.90] if subtitle else None)
 fig.savefig(plot_path, dpi=120)
 print(f"\nPlot saved to {plot_path}")
 
