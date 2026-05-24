@@ -105,9 +105,9 @@ parser.add_argument(
     help=(
         "Per-iteration: chain run_alert_only.py + run_enrichment_only.py to "
         "fill the filter queue, then run_filter_only.py to measure the "
-        "filter-worker wall time (starting filter worker -> Kafka "
-        "ZTF_alerts_results offset sum reaches N_FILTERS * EXPECTED_ALERTS). "
-        "Only --vary filter is meaningful (no GPU inference)."
+        "filter-worker wall time (starting filter worker -> every alert "
+        "processed by every filter, counted from scheduler 'passed filter' log "
+        "lines / N_FILTERS). Only --vary filter is meaningful (no GPU inference)."
     ),
 )
 args = parser.parse_args()
@@ -175,12 +175,23 @@ elif args.enrichment_only:
     stage_only_prefix = "enrichment-only-"
 elif args.filter_only:
     stage_only_prefix = "filter-only-"
+if args.alert_only:
+    workers_part = f"na=[{args.min}-{args.max}]"
+elif args.enrichment_only:
+    workers_part = (f"ne={args.n_enrichment_workers}" if args.vary == "gpu"
+                    else f"ne=[{args.min}-{args.max}]")
+elif args.filter_only:
+    workers_part = f"nf=[{args.min}-{args.max}]"
+else:
+    workers_part = (
+        f"na={args.n_alert_workers if args.vary != 'alert' else f'[{args.min}-{args.max}]'}-"
+        f"ne={args.n_enrichment_workers if args.vary != 'enrichment' else f'[{args.min}-{args.max}]'}-"
+        f"nf={args.n_filter_workers if args.vary != 'filter' else f'[{args.min}-{args.max}]'}"
+    )
 out_path = args.out or (f"logs/benchmark-sweep/"
                         f"{stage_only_prefix}"
                         f"{gpu_prefix}"
-                        f"na={args.n_alert_workers if args.vary != 'alert' else f'[{args.min}-{args.max}]'}-"
-                        f"ne={args.n_enrichment_workers if args.vary != 'enrichment' else f'[{args.min}-{args.max}]'}-"
-                        f"nf={args.n_filter_workers if args.vary != 'filter' else f'[{args.min}-{args.max}]'}"
+                        f"{workers_part}"
                         f"{gpu_suffix}-"
                         f"{timestamp}")
 plot_path = out_path + ".png"
