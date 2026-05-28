@@ -9,7 +9,7 @@ import sys
 import matplotlib.pyplot as plt
 
 WORKER_KINDS = ("alert", "enrichment", "filter")
-SWEEP_KINDS = WORKER_KINDS + ("gpu",)
+SWEEP_KINDS = WORKER_KINDS + ("gpu", "process", "batch")
 EXPECTED_ALERTS = 29142  # must match _run.sh
 
 parser = argparse.ArgumentParser(
@@ -24,9 +24,21 @@ parser.add_argument(
 )
 parser.add_argument("--min", type=int, default=1)
 parser.add_argument("--max", type=int, default=10)
+parser.add_argument("--step", type=int, default=1)
 parser.add_argument("--n-alert-workers", type=int, default=20)
-parser.add_argument("--n-enrichment-workers", type=int, default=33)
-parser.add_argument("--n-filter-workers", type=int, default=15)
+parser.add_argument("--n-enrichment-workers", type=int, default=28)
+parser.add_argument("--n-filter-workers", type=int, default=18)
+parser.add_argument(
+    "--n-processes", type=int, default=1,
+    help="kafka_consumer --processes value (only used with --kafka-consumer-only; "
+         "swept when --vary process).",
+)
+parser.add_argument(
+    "--batch-size", type=int, default=None,
+    help="Override KAFKA_BATCH_SIZE (sent via BOOM_KAFKA_BATCH_SIZE env var). "
+         "Only used with --kafka-consumer-only. Swept when --vary batch (in "
+         "which case --min/--max are the range of batch sizes).",
+)
 parser.add_argument("--boom-repo-dir", default=".")
 parser.add_argument("--timeout", type=int, default=600)
 parser.add_argument("--out", default=None, help="Output plot path")
@@ -110,11 +122,43 @@ parser.add_argument(
         "lines / N_FILTERS). Only --vary filter is meaningful (no GPU inference)."
     ),
 )
+parser.add_argument(
+    "--kafka-consumer-only",
+    action="store_true",
+    help=(
+        "Per-iteration: run_kafka_consumer_only.py to measure the kafka_consumer "
+        "wall time (consumer first message -> LLEN ZTF_alerts_packets_queue == "
+        "EXPECTED_ALERTS). No scheduler runs; all worker counts forced to 0. "
+        "Use --vary process --min M --max N to sweep the kafka_consumer "
+        "--processes value across [M, N]."
+    ),
+)
+parser.add_argument(
+    "--alert-worker-only",
+    action="store_true",
+    help=(
+        "Per-iteration: run_alert_worker_only.py to measure pure alert-worker "
+        "wall time (last 'alert worker ready' log -> LLEN "
+        "ZTF_alerts_enrichment_queue == EXPECTED_ALERTS). The packets queue is "
+        "pre-filled at the start of each iteration by an --exit-on-eof "
+        "kafka_consumer run, so the measurement excludes the kafka -> valkey "
+        "transfer cost. Only --vary alert is meaningful."
+    ),
+)
 args = parser.parse_args()
 
-stage_only_flags = [args.alert_only, args.enrichment_only, args.filter_only]
+stage_only_flags = [
+    args.alert_only,
+    args.enrichment_only,
+    args.filter_only,
+    args.kafka_consumer_only,
+    args.alert_worker_only,
+]
 if sum(stage_only_flags) > 1:
-    sys.exit("--alert-only / --enrichment-only / --filter-only are mutually exclusive")
+    sys.exit(
+        "--alert-only / --enrichment-only / --filter-only / "
+        "--kafka-consumer-only / --alert-worker-only are mutually exclusive"
+    )
 
 phase_only_flags = [args.init, args.clean, args.bench_only]
 if sum(phase_only_flags) > 1:
@@ -148,6 +192,28 @@ if args.filter_only and args.vary != "filter":
         f"Alert/enrichment workers are forced to 0, and the filter worker does "
         f"no GPU inference."
     )
+if args.alert_worker_only and args.vary != "alert":
+    sys.exit(
+        f"--alert-worker-only is only meaningful with --vary alert (got --vary {args.vary}). "
+        f"Enrichment/filter workers are forced to 0, and the alert worker does no "
+        f"GPU inference."
+    )
+if args.kafka_consumer_only and args.vary not in ("process", "batch"):
+    sys.exit(
+        f"--kafka-consumer-only is only meaningful with --vary process or "
+        f"--vary batch (got --vary {args.vary}). No scheduler runs, so "
+        f"alert/enrichment/filter/gpu sweep dims have no effect here."
+    )
+if args.vary == "process" and not args.kafka_consumer_only:
+    sys.exit(
+        "--vary process is only meaningful with --kafka-consumer-only "
+        "(it sweeps kafka_consumer --processes, which is not exposed in any other mode)."
+    )
+if args.vary == "batch" and not args.kafka_consumer_only:
+    sys.exit(
+        "--vary batch is only meaningful with --kafka-consumer-only "
+        "(it sweeps BOOM_KAFKA_BATCH_SIZE, which only affects the consumer)."
+    )
 
 gpu_mode = args.vary == "gpu" or args.gpu or bool(args.gpu_device_ids)
 if gpu_mode:
@@ -175,6 +241,10 @@ elif args.enrichment_only:
     stage_only_prefix = "enrichment-only-"
 elif args.filter_only:
     stage_only_prefix = "filter-only-"
+elif args.kafka_consumer_only:
+    stage_only_prefix = "kafka-consumer-only-"
+elif args.alert_worker_only:
+    stage_only_prefix = "alert-worker-only-"
 if args.alert_only:
     workers_part = f"na=[{args.min}-{args.max}]"
 elif args.enrichment_only:
@@ -182,6 +252,13 @@ elif args.enrichment_only:
                     else f"ne=[{args.min}-{args.max}]")
 elif args.filter_only:
     workers_part = f"nf=[{args.min}-{args.max}]"
+elif args.alert_worker_only:
+    workers_part = f"na=[{args.min}-{args.max}]"
+elif args.kafka_consumer_only:
+    if args.vary == "process":
+        workers_part = f"np=[{args.min}-{args.max}]"
+    else:  # "batch"
+        workers_part = f"np={args.n_processes}-bs=[{args.min}-{args.max}]"
 else:
     workers_part = (
         f"na={args.n_alert_workers if args.vary != 'alert' else f'[{args.min}-{args.max}]'}-"
@@ -205,6 +282,12 @@ run_enrichment_only_py = os.path.join(
 )
 run_filter_only_py = os.path.join(
     args.boom_repo_dir, "tests", "throughput", "run_filter_only.py"
+)
+run_kafka_consumer_only_py = os.path.join(
+    args.boom_repo_dir, "tests", "throughput", "run_kafka_consumer_only.py"
+)
+run_alert_worker_only_py = os.path.join(
+    args.boom_repo_dir, "tests", "throughput", "run_alert_worker_only.py"
 )
 
 
@@ -274,6 +357,41 @@ def run_filter_only_bench(counts: dict[str, int]) -> int:
     return subprocess.run(cmd).returncode
 
 
+def run_kafka_consumer_only_bench(n_processes: int,
+                                  batch_size: int | None) -> int:
+    """Invoke run_kafka_consumer_only.py for a single bench iteration.
+
+    n_processes is forwarded as `kafka_consumer --processes N` and tags the
+    logs_dir (boom-kafka-consumer-only-np=N). batch_size, when provided,
+    sets BOOM_KAFKA_BATCH_SIZE in the consumer and adds `-bs=B` to the
+    logs_dir tag.
+    """
+    cmd = [
+        sys.executable,
+        run_kafka_consumer_only_py,
+        "--apptainer",
+        "--n-processes", str(n_processes),
+        "--boom-repo-dir", args.boom_repo_dir,
+        "--timeout", str(args.timeout),
+    ]
+    if batch_size is not None:
+        cmd += ["--batch-size", str(batch_size)]
+    return subprocess.run(cmd).returncode
+
+
+def run_alert_worker_only_bench(counts: dict[str, int]) -> int:
+    """Invoke run_alert_worker_only.py for a single bench iteration."""
+    cmd = [
+        sys.executable,
+        run_alert_worker_only_py,
+        "--apptainer",
+        "--n-alert-workers", str(counts["alert"]),
+        "--boom-repo-dir", args.boom_repo_dir,
+        "--timeout", str(args.timeout),
+    ]
+    return subprocess.run(cmd).returncode
+
+
 def gpus_for_path(n: int) -> int:
     """Mirror the gpu=N component of the logs_dir that run.py writes to.
 
@@ -337,7 +455,7 @@ if args.warm:
         sys.exit(f"Warm setup failed (rc={setup_rc}); aborting sweep")
 
 results: list[tuple[int, float, float]] = []
-for n in range(args.min, args.max + 1):
+for n in range(args.min, args.max + 1, args.step):
     counts = {
         "alert": args.n_alert_workers,
         "enrichment": args.n_enrichment_workers,
@@ -346,10 +464,14 @@ for n in range(args.min, args.max + 1):
     if args.vary in WORKER_KINDS:
         counts[args.vary] = n
         label = f"{args.vary}_workers={n}"
-    else:
+    elif args.vary == "gpu":
         device_ids = ",".join(str(i) for i in range(n))
         os.environ["BOOM_GPU__DEVICE_IDS"] = device_ids
         label = f"n_gpus={n} (device_ids={device_ids})"
+    elif args.vary == "process":
+        label = f"n_processes={n}"
+    else:  # "batch" -- BOOM_KAFKA_BATCH_SIZE
+        label = f"batch_size={n}"
 
     if args.alert_only:
         # Alert + filter workers run no GPU inference, so run_alert_only.py /
@@ -370,6 +492,24 @@ for n in range(args.min, args.max + 1):
             f"logs/boom-filter-only-nf={counts['filter']}"
             f"/filter_worker_wall_time.txt"
         )
+    elif args.kafka_consumer_only:
+        # With --vary process, n is the kafka_consumer --processes value and
+        # batch_size is fixed (or default). With --vary batch, n is the batch
+        # size and processes is fixed.
+        if args.vary == "process":
+            np_value, bs_value = n, args.batch_size
+        else:  # "batch"
+            np_value, bs_value = args.n_processes, n
+        suffix = f"-bs={bs_value}" if bs_value is not None else ""
+        wall_time_path = (
+            f"logs/boom-kafka-consumer-only-np={np_value}{suffix}"
+            f"/kafka_consumer_wall_time.txt"
+        )
+    elif args.alert_worker_only:
+        wall_time_path = (
+            f"logs/boom-alert-worker-only-na={counts['alert']}"
+            f"/alert_worker_wall_time.txt"
+        )
     else:
         wall_time_path = (
             f"logs/boom-na={counts['alert']}"
@@ -386,14 +526,16 @@ for n in range(args.min, args.max + 1):
             continue
     else:
         print(f"\n=== Running with {label} ===", flush=True)
-        if args.alert_only or args.enrichment_only or args.filter_only:
+        if (args.alert_only or args.enrichment_only or args.filter_only
+                or args.kafka_consumer_only or args.alert_worker_only):
             # The "*_only" benchmarks rely on services that --warm (or a prior
             # --init invocation, reused via --bench-only) brings up exactly
             # once. Without either there is no setup phase and the downstream
             # shell scripts would refuse to run.
             if not (args.warm or args.bench_only):
                 sys.exit(
-                    "--alert-only / --enrichment-only / --filter-only require "
+                    "--alert-only / --enrichment-only / --filter-only / "
+                    "--kafka-consumer-only / --alert-worker-only require "
                     "--warm or --bench-only (the *_only scripts assume services "
                     "are already running)."
                 )
@@ -405,6 +547,10 @@ for n in range(args.min, args.max + 1):
             # to refill the relevant queues. Yes, this is slow for sweeps that
             # only vary the last stage, but it is the only way to keep the
             # measurement of stage N independent of the stage-(N-1) workload.
+            #
+            # --kafka-consumer-only and --alert-worker-only are self-contained
+            # (the latter prefills its own packets queue inside its shell
+            # script) and therefore need no prerequisite-stage refill.
             rc = 0
             if args.enrichment_only or args.filter_only:
                 rc = run_alert_only_bench(counts)
@@ -415,8 +561,15 @@ for n in range(args.min, args.max + 1):
                     rc = run_alert_only_bench(counts)
                 elif args.enrichment_only:
                     rc = run_enrichment_only_bench(counts)
-                else:
+                elif args.filter_only:
                     rc = run_filter_only_bench(counts)
+                elif args.kafka_consumer_only:
+                    if args.vary == "process":
+                        rc = run_kafka_consumer_only_bench(n, args.batch_size)
+                    else:  # "batch"
+                        rc = run_kafka_consumer_only_bench(args.n_processes, n)
+                else:  # args.alert_worker_only
+                    rc = run_alert_worker_only_bench(counts)
         else:
             phase = "bench" if args.warm or args.bench_only else "full"
             rc = run_phase(phase, counts)
@@ -458,19 +611,33 @@ fixed = {k: v for k, v in {
 }.items() if k != args.vary and k in fixed_stages}
 fixed_str = ", ".join(f"{k}={v}" for k, v in fixed.items())
 
-vary_label = "GPUs" if args.vary == "gpu" else f"{args.vary} workers"
-csv_col_name = "n_gpus" if args.vary == "gpu" else f"n_{args.vary}_workers"
+if args.vary == "gpu":
+    vary_label = "GPUs"
+    csv_col_name = "n_gpus"
+    x_axis_label = "Number of GPUs"
+elif args.vary == "process":
+    vary_label = "consumer processes"
+    csv_col_name = "n_processes"
+    x_axis_label = "Number of consumer processes"
+elif args.vary == "batch":
+    vary_label = "KAFKA_BATCH_SIZE"
+    csv_col_name = "batch_size"
+    x_axis_label = "KAFKA_BATCH_SIZE"
+else:
+    vary_label = f"{args.vary} workers"
+    csv_col_name = f"n_{args.vary}_workers"
+    x_axis_label = f"Number of {vary_label}"
 
 os.makedirs(os.path.dirname(plot_path) or ".", exist_ok=True)
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 ax1.plot(xs, walls, marker="o")
-ax1.set_xlabel(f"Number of {vary_label}")
+ax1.set_xlabel(x_axis_label)
 ax1.set_ylabel("Wall time (s)")
 ax1.set_title(f"Wall time vs. {vary_label}")
 ax1.grid(True, alpha=0.3)
 
 ax2.plot(xs, tputs, marker="o", color="C2")
-ax2.set_xlabel(f"Number of {vary_label}")
+ax2.set_xlabel(x_axis_label)
 ax2.set_ylabel("Throughput (alerts/s)")
 ax2.set_title(f"Throughput vs. {vary_label}")
 ax2.grid(True, alpha=0.3)
