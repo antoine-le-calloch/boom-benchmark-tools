@@ -25,9 +25,9 @@ parser.add_argument(
 parser.add_argument("--min", type=int, default=1)
 parser.add_argument("--max", type=int, default=10)
 parser.add_argument("--step", type=int, default=1)
-parser.add_argument("--n-alert-workers", type=int, default=20)
+parser.add_argument("--n-alert-workers", type=int, default=28)
 parser.add_argument("--n-enrichment-workers", type=int, default=28)
-parser.add_argument("--n-filter-workers", type=int, default=18)
+parser.add_argument("--n-filter-workers", type=int, default=28)
 parser.add_argument(
     "--n-processes", type=int, default=1,
     help="kafka_consumer --processes value (only used with --kafka-consumer-only; "
