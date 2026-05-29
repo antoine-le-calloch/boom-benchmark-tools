@@ -130,9 +130,8 @@ for path in sorted(glob.glob(os.path.join(RESULTS_DIR, "*.csv"))):
 argus_label = f"argus rate ({ARGUS_RATE} alerts/s)"
 ax.axhline(ARGUS_RATE, color="red", linestyle="-.", linewidth=2, label=argus_label)
 
-ax.set_xlabel("number of workers")
-ax.set_ylabel("throughput (alerts / s)")
-ax.set_title("Benchmark throughput")
+ax.set_xlabel("number of workers", fontsize=14)
+ax.set_ylabel("throughput (alerts / s)", fontsize=14)
 ax.grid(True, alpha=0.3)
 
 # Legend order: reference lines first, then curves, then full pipeline, with the
