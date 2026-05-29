@@ -47,7 +47,7 @@ COLORS = {
 # The full-pipeline benchmark (gpu, varying enrichment workers, fixed alert and
 # filter workers). Its label is built from the worker counts in the filename so
 # it stays correct if those change. It is highlighted to stand out.
-FULL_PIPELINE_PATTERN = re.compile(r"gpu-na=(?P<na>\d+)-ne=\[[^\]]*\]-nf=(?P<nf>\d+)")
+FULL_PIPELINE_PATTERN = re.compile(r"gpu-na=(?P<na>\d+)-ne=\[[^]]*]-nf=(?P<nf>\d+)")
 
 # Shades of red cycled through for the full-pipeline curves: each is the headline
 # result, so they stay red, but when several are plotted at once a slightly
