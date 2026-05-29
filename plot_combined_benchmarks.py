@@ -98,7 +98,7 @@ for path in sorted(glob.glob(os.path.join(RESULTS_DIR, "*.csv"))):
         reference_labels.append(label)
     else:
         frame = frame.sort_values(x_column)
-        plot_kwargs = {"marker": "o", "markersize": 4}
+        plot_kwargs: dict[str, object] = {"marker": "o", "markersize": 4}
         if basename in GREYED_OUT:
             # Configurations not used in production: faded, as a comparison only.
             plot_kwargs.update(color="grey", alpha=0.5, linestyle="--")
