@@ -1,13 +1,17 @@
 """Combine every per-component benchmark CSV into a single throughput plot.
 
-Reads all CSVs in logs/benchmark-results/. Files whose first column is a worker
-count (n_alert_workers / n_enrichment_workers / n_filter_workers) are drawn as
+Reads all CSVs in the input directory. Files whose first column is a worker count
+(n_alert_workers / n_enrichment_workers / n_filter_workers) are drawn as
 throughput curves against the number of workers; files that vary batch_size
 (the kafka consumer) are drawn as a single horizontal constant.
 
-The figure and a merged CSV are written to logs/benchmark-combined/.
+The figure and a merged CSV are written to the output directory.
+
+Usage:
+    python plot_combined_benchmarks.py [--input-dir INPUT_DIR] [--output-dir OUTPUT_DIR]
 """
 
+import argparse
 import glob
 import os
 import re
@@ -15,12 +19,23 @@ import re
 import matplotlib.pyplot as plt
 import pandas as pd
 
-RESULTS_DIR = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "logs", "benchmark-results")
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument(
+    "-i",
+    "--input-dir",
+    default="benchmark-results/",
+    help="Directory containing the benchmark CSVs (default: benchmark-results/).",
 )
-OUT_DIR = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "logs", "benchmark-combined")
+parser.add_argument(
+    "-o",
+    "--output-dir",
+    default="benchmark-combined/",
+    help="Directory to write the figure and merged CSV to (default: benchmark-combined/).",
 )
+arguments = parser.parse_args()
+
+RESULTS_DIR = os.path.abspath(arguments.input_dir)
+OUT_DIR = os.path.abspath(arguments.output_dir)
 os.makedirs(OUT_DIR, exist_ok=True)
 OUT_BASE = os.path.join(OUT_DIR, "combined-benchmarks")
 
