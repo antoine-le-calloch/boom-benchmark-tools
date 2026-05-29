@@ -145,8 +145,9 @@ for path in sorted(glob.glob(os.path.join(RESULTS_DIR, "*.csv"))):
 argus_label = f"argus rate ({ARGUS_RATE} alerts/s)"
 ax.axhline(ARGUS_RATE, color="red", linestyle="-.", linewidth=2, label=argus_label)
 
-ax.set_xlabel("number of workers", fontsize=20)
-ax.set_ylabel("throughput (alerts / s)", fontsize=20)
+ax.set_xlabel("NUMBER OF WORKERS", fontsize=18)
+ax.set_ylabel("THROUGHPUT (alerts / s)", fontsize=18)
+ax.tick_params(axis="both", labelsize=14)
 ax.grid(True, alpha=0.3)
 
 # Legend order: reference lines first, then curves, then full pipeline, with the
@@ -156,7 +157,7 @@ label_to_handle = dict(zip(labels, handles))
 tail = full_pipeline_labels + [argus_label]
 ordered = reference_labels + [name for name in labels if name not in reference_labels + tail]
 ordered += tail
-ax.legend([label_to_handle[name] for name in ordered], ordered)
+ax.legend([label_to_handle[name] for name in ordered], ordered, fontsize=12)
 
 fig.tight_layout()
 fig.savefig(OUT_BASE + ".png", dpi=150)
